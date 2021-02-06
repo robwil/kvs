@@ -31,10 +31,7 @@ impl KvStore {
 
     /// Get Some(value) from the KvStore, searching by `key`. If the `key` is not present, None will be returned.
     pub fn get(&self, key: String) -> Option<String> {
-        match self.map.get(&key) {
-            Some(val) => Some(val.clone()),
-            None => None,
-        }
+        self.map.get(&key).cloned()
     }
 
     /// Removes `key` from the KvStore. This will succeed whether the `key` is present or not.
