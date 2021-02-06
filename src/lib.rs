@@ -6,6 +6,14 @@
 use std::collections::HashMap;
 
 /// A basic String key-value store, which will store its keys and values in memory.
+/// 
+/// ```rust
+/// # use kvs::KvStore;
+/// let mut store = KvStore::new();
+/// store.set("key".to_owned(), "value".to_owned());
+/// let val = store.get("key".to_owned());
+/// assert_eq!(val, Some("value".to_owned()));
+/// ```
 pub struct KvStore {
     map: HashMap<String, String>,
 }
