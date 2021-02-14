@@ -1,4 +1,6 @@
 use clap::{App, AppSettings, Arg, SubCommand};
+use kvs::{Result, KvStore};
+use anyhow::{Context, bail};
 
 fn main() {
     let matches = App::new(env!("CARGO_PKG_NAME"))
@@ -51,27 +53,26 @@ fn main() {
     })
 }
 
-fn handle_args(matches: &clap::ArgMatches) -> Result<(), String> {
+fn handle_args(matches: &clap::ArgMatches) -> Result<()> {
+    let mut kv_store = KvStore::open("./my.db")?;
     if let Some(matches) = matches.subcommand_matches("get") {
-        let key = matches.value_of("KEY").unwrap();
-        return Err(format!(
-            "unimplemented, but would have looked up key {}",
-            key
-        ));
+        let key = matches.value_of("KEY").context("Getting KEY value")?;
+        if let Some(value) = kv_store.get(key.to_owned())? {
+            println!("{}", value);
+        } else {
+            bail!(format!("key {} not found", key));
+        }
     }
 
     if let Some(matches) = matches.subcommand_matches("set") {
-        let key = matches.value_of("KEY").unwrap();
-        let value = matches.value_of("VALUE").unwrap();
-        return Err(format!(
-            "unimplemented, but would have set key {} to {}",
-            key, value
-        ));
+        let key = matches.value_of("KEY").context("Getting KEY value")?;
+        let value = matches.value_of("VALUE").context("Getting VALUE value")?;
+        kv_store.set(key.to_owned(), value.to_owned())?;
     }
 
     if let Some(matches) = matches.subcommand_matches("rm") {
-        let key = matches.value_of("KEY").unwrap();
-        return Err(format!("unimplemented, but would have removed key {}", key));
+        let key = matches.value_of("KEY").context("Getting KEY value")?;
+        kv_store.remove(key.to_owned())?;
     }
 
     Ok(())
