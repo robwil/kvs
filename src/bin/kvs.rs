@@ -1,6 +1,6 @@
 use clap::{App, AppSettings, Arg, SubCommand};
 use kvs::{Result, KvStore};
-use anyhow::{Context, bail};
+use anyhow::{Context};
 
 fn main() {
     let matches = App::new(env!("CARGO_PKG_NAME"))
@@ -47,20 +47,21 @@ fn main() {
     std::process::exit(match handle_args(&matches) {
         Ok(_) => 0,
         Err(err) => {
-            eprintln!("error: {:?}", err);
+            println!("error: {:?}", err);
             1
         }
     })
 }
 
 fn handle_args(matches: &clap::ArgMatches) -> Result<()> {
-    let mut kv_store = KvStore::open("./db/")?;
+    let mut kv_store = KvStore::open(".")?;
     if let Some(matches) = matches.subcommand_matches("get") {
         let key = matches.value_of("KEY").context("Getting KEY value")?;
         if let Some(value) = kv_store.get(key.to_owned())? {
             println!("{}", value);
         } else {
-            bail!(format!("key {} not found", key));
+            // print error but still exit ok
+            println!("Key not found");
         }
     }
 

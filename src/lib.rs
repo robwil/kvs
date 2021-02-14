@@ -5,7 +5,7 @@
 
 mod command;
 
-use anyhow::Context;
+use anyhow::{Context, bail};
 pub use anyhow::Result;
 use command::Command;
 use std::collections::HashMap;
@@ -17,11 +17,15 @@ use std::path::PathBuf;
 /// A basic String key-value store, which will store its keys and values in memory.
 ///
 /// ```rust
-/// # use kvs::KvStore;
-/// let mut store = KvStore::new();
-/// store.set("key".to_owned(), "value".to_owned());
-/// let val = store.get("key".to_owned());
+/// # use kvs::{KvStore, Result};
+/// # fn try_main() -> Result<()> {
+/// use std::env::current_dir;
+/// let mut store = KvStore::open(current_dir()?)?;
+/// store.set("key".to_owned(), "value".to_owned())?;
+/// let val = store.get("key".to_owned())?;
 /// assert_eq!(val, Some("value".to_owned()));
+/// # Ok(())
+/// # }
 /// ```
 pub struct KvStore {
     // directory for the log and other data.
@@ -48,10 +52,10 @@ impl KvStore {
             while let Ok(cmd) = Command::from_reader(&mut file) {
                 match cmd {
                     Command::Set { key, value } => {
-                        internal_map.set(key, value);
+                        internal_map.set(key, value)?;
                     }
                     Command::Remove { key } => {
-                        internal_map.remove(key);
+                        internal_map.remove(key)?;
                     }
                 }
             }
@@ -120,7 +124,9 @@ impl InternalMap {
         Ok(self.map.get(&key).cloned())
     }
     fn remove(&mut self, key: String) -> Result<()> {
-        self.map.remove(&key);
+        if let None = self.map.remove(&key) {
+            bail!("Key not found");
+        }
         Ok(())
     }
 }
