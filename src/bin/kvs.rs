@@ -54,7 +54,7 @@ fn main() {
 }
 
 fn handle_args(matches: &clap::ArgMatches) -> Result<()> {
-    let mut kv_store = KvStore::open("./my.db")?;
+    let mut kv_store = KvStore::open("./db/")?;
     if let Some(matches) = matches.subcommand_matches("get") {
         let key = matches.value_of("KEY").context("Getting KEY value")?;
         if let Some(value) = kv_store.get(key.to_owned())? {
