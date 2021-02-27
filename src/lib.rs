@@ -5,13 +5,16 @@
 
 mod command;
 
-use anyhow::{Context, bail};
+use std::path::Path;
 pub use anyhow::Result;
+use anyhow::{bail, Context};
 use command::Command;
 use std::collections::HashMap;
 use std::fs;
 use std::io::BufReader;
 use std::io::BufWriter;
+use std::io::Seek;
+use std::io::SeekFrom;
 use std::path::PathBuf;
 
 /// A basic String key-value store, which will store its keys and values in memory.
@@ -49,15 +52,17 @@ impl KvStore {
         let mut internal_map = InternalMap::new();
         // TODO: don't hard-code gen
         if let Ok(mut file) = get_read_handle(&path, 1) {
+            let mut current_pos = file.seek(SeekFrom::Current(0))?;
             while let Ok(cmd) = Command::from_reader(&mut file) {
                 match cmd {
-                    Command::Set { key, value } => {
-                        internal_map.set(key, value)?;
+                    Command::Set { key, value: _ } => {
+                        internal_map.set(key, current_pos)?;
                     }
                     Command::Remove { key } => {
                         internal_map.remove(key)?;
                     }
                 }
+                current_pos = file.seek(SeekFrom::Current(0))?;
             }
         } else {
             // TODO: only skip file read if it's File Not Found error, as opposed to others
@@ -71,21 +76,41 @@ impl KvStore {
 
     /// Set a `value` for `key`. If `key` was already present, the new `value` will override it.
     pub fn set(&mut self, key: String, value: String) -> Result<()> {
-        // TODO: remove these clones. actually should probably just make the input a &str
-        self.map.set(key.clone(), value.clone())?;
-
         // TODO: don't open file handle on every command
         // TODO: don't hard-code gen
-        let file = get_write_handle(&self.path, 1)
+        let mut file = get_write_handle(&self.path, 1)
             .context("Opening file for writing during set command")?;
+
+        // Store current end position to map
+        let current_pos = file.seek(SeekFrom::End(0))?;
+        // TODO: remove these clones. actually should probably just make the input a &str
+        self.map.set(key.clone(), current_pos)?;
+
+        // Actually write to file
         let cmd = Command::Set { key, value };
-        cmd.to_writer(file)?;
+        cmd.to_writer(&mut file)?;
+
         Ok(())
     }
 
     /// Get Some(value) from the KvStore, searching by `key`. If the `key` is not present, None will be returned.
     pub fn get(&self, key: String) -> Result<Option<String>> {
-        self.map.get(key)
+        let value = self.map.get(key)?.and_then(|file_pos| {
+            // TODO: don't open file handle on every command
+            // TODO: don't hard-code gen
+            // TODO: these Results -> Option conversion are bad. How do we propagate Result out?
+            let mut file = get_read_handle(&self.path, 1).ok()?;
+            file.seek(SeekFrom::Start(file_pos)).ok()?;
+            if let Ok(cmd) = Command::from_reader(&mut file) {
+                match cmd {
+                    Command::Set { key: _, value } => Some(value),
+                    Command::Remove { key: _ } => None,
+                }
+            } else {
+                None
+            }
+        });
+        Ok(value)
     }
 
     /// Removes `key` from the KvStore. This will succeed whether the `key` is present or not.
@@ -104,9 +129,9 @@ impl KvStore {
 }
 
 /// InternalMap is the in-memory mapping of keys used to save trips to disk.
+/// The values in the map are file offsets used to seek to the true values on disk.
 struct InternalMap {
-    // TODO: only store reference to log records and not the value
-    map: HashMap<String, String>,
+    map: HashMap<String, u64>,
 }
 
 impl InternalMap {
@@ -115,23 +140,22 @@ impl InternalMap {
             map: HashMap::new(),
         }
     }
-    fn set(&mut self, key: String, value: String) -> Result<()> {
-        self.map.insert(key.clone(), value.clone());
+    fn set(&mut self, key: String, file_pos: u64) -> Result<()> {
+        self.map.insert(key, file_pos);
         Ok(())
     }
-    fn get(&self, key: String) -> Result<Option<String>> {
-        // TODO: in the future this would read from disk
+    fn get(&self, key: String) -> Result<Option<u64>> {
         Ok(self.map.get(&key).cloned())
     }
     fn remove(&mut self, key: String) -> Result<()> {
-        if let None = self.map.remove(&key) {
+        if self.map.remove(&key).is_none() {
             bail!("Key not found");
         }
         Ok(())
     }
 }
 
-fn get_write_handle(path: &PathBuf, gen: u64) -> Result<BufWriter<fs::File>> {
+fn get_write_handle(path: &Path, gen: u64) -> Result<BufWriter<fs::File>> {
     let file_path = log_path(path, gen);
     let context = format!("Opening file {:?} for writing", file_path.to_str());
     let file = fs::OpenOptions::new()
@@ -143,7 +167,7 @@ fn get_write_handle(path: &PathBuf, gen: u64) -> Result<BufWriter<fs::File>> {
     Ok(BufWriter::new(file))
 }
 
-fn get_read_handle(path: &PathBuf, gen: u64) -> Result<BufReader<fs::File>> {
+fn get_read_handle(path: &Path, gen: u64) -> Result<BufReader<fs::File>> {
     let file_path = log_path(path, gen);
     let context = format!("Opening file {:?} for reading", file_path.to_str());
     let file = fs::OpenOptions::new()
@@ -153,6 +177,6 @@ fn get_read_handle(path: &PathBuf, gen: u64) -> Result<BufReader<fs::File>> {
     Ok(BufReader::new(file))
 }
 
-fn log_path(dir: &PathBuf, gen: u64) -> PathBuf {
+fn log_path(dir: &Path, gen: u64) -> PathBuf {
     dir.join(format!("{}.log", gen))
 }
