@@ -1,0 +1,27 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Cargo test",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--test",
+                    "tests"
+                ]
+            },
+            "program": "${cargo:program}",
+            "args": []
+        },
+        {
+            "name": "(OSX) Launch",
+            "type": "lldb",
+            "request": "launch",
+            "program": "${workspaceRoot}/target/debug/kvs",
+            "args": ["interactive"],
+            "cwd": "${workspaceRoot}",
+        }
+    ]
+}
