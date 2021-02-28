@@ -9,6 +9,7 @@ pub use anyhow::Result;
 use anyhow::{anyhow, bail, Context};
 use command::Command;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::fs;
 use std::io::BufReader;
@@ -48,6 +49,8 @@ pub struct KvStore {
     wasted_bytes: usize,
 }
 
+const COMPACTION_BYTES_THRESHOLD: usize = 1024 * 1024; // 1MB wasted space (very eager compaction)
+
 impl KvStore {
     /// Opens a `KvStore` with the given path.
     ///
@@ -69,12 +72,12 @@ impl KvStore {
             // Brand new database, so start with current_generation = 1
             current_generation = 1;
             // need to create writer & reader handles since we won't be going through usual load() path below
-            writer = get_write_handle(&path, 1)
+            writer = get_write_handle(&path, 1, LogFileType::Blessed)
                 .context("Opening file for writing during initialization")?;
-            readers.insert(1, get_read_handle(&path, 1)?);
+            readers.insert(1, get_read_handle(&path, 1, LogFileType::Blessed)?);
         } else {
             current_generation = gen_list.last().copied().unwrap();
-            writer = get_write_handle(&path, current_generation)
+            writer = get_write_handle(&path, current_generation, LogFileType::Blessed)
                 .context("Opening file for writing during initialization")?;
         }
 
@@ -96,15 +99,16 @@ impl KvStore {
 
     /// load will read a generation's log file from disk, modifying the in-memory map with the proper file offsets
     fn load(&mut self, generation: u64) -> Result<()> {
-        let mut reader = get_read_handle(&self.path, generation)
+        let mut reader = get_read_handle(&self.path, generation, LogFileType::Blessed)
             .context("Opening file for reading during load")?;
         let mut current_pos = reader.seek(SeekFrom::Current(0))?;
         while let Ok(cmd) = Command::from_reader(&mut reader) {
             match cmd {
                 Command::Set { key, value } => {
                     let estimated_bytes = key.len() + value.len();
-                    self.wasted_bytes += self.map
-                        .set(&key, generation, current_pos, estimated_bytes)?;
+                    self.wasted_bytes +=
+                        self.map
+                            .set(&key, generation, current_pos, estimated_bytes)?;
                 }
                 Command::Remove { key } => {
                     self.wasted_bytes += self.map.remove(&key)?;
@@ -118,18 +122,19 @@ impl KvStore {
 
     /// Set a `value` for `key`. If `key` was already present, the new `value` will override it.
     pub fn set(&mut self, key: String, value: String) -> Result<()> {
-        // Store current end position to map
         let current_pos = self.writer.seek(SeekFrom::End(0))?;
         let estimated_bytes = key.len() + value.len();
+        let cmd = Command::Set {
+            key: key.clone(),
+            value,
+        };
+        cmd.to_writer(&mut self.writer)?;
+        self.writer.flush()?;
+        // internal book-keeping performed after successful disk write
         self.wasted_bytes +=
             self.map
                 .set(&key, self.current_generation, current_pos, estimated_bytes)?;
-
-        // Actually write to file
-        let cmd = Command::Set { key, value };
-        cmd.to_writer(&mut self.writer)?;
-        self.writer.flush()?;
-
+        self.maybe_run_compaction()?;
         Ok(())
     }
 
@@ -143,7 +148,7 @@ impl KvStore {
                 estimated_bytes: _,
             }) => {
                 let mut reader = self.readers.get_mut(&generation).ok_or(anyhow!(
-                    "Unable to open reader for generation {}",
+                    "Unable to open reader for generation {} during get",
                     generation
                 ))?;
                 reader.seek(SeekFrom::Start(file_pos))?;
@@ -157,10 +162,119 @@ impl KvStore {
 
     /// Removes `key` from the KvStore. This will throw an error if the `key` does not already exist.
     pub fn remove(&mut self, key: String) -> Result<()> {
-        self.wasted_bytes += self.map.remove(&key)?;
-
-        let cmd = Command::Remove { key };
+        let cmd = Command::Remove { key: key.clone() };
         cmd.to_writer(&mut self.writer)?;
+        self.writer.flush()?;
+        // internal book-keeping performed after successful disk write
+        self.wasted_bytes += self.map.remove(&key)?;
+        self.maybe_run_compaction()?;
+        Ok(())
+    }
+
+    /// Checks if compaction is desired, and if so run the compaction now.
+    fn maybe_run_compaction(&mut self) -> Result<()> {
+        if self.wasted_bytes < COMPACTION_BYTES_THRESHOLD {
+            return Ok(());
+        }
+
+        // Step 1) Create two new log files, one for compaction and one for new writes.
+        let gen_list = sorted_gen_list(&self.path)?;
+        let compaction_target_generation = self.current_generation + 1;
+        let new_writes_generation = self.current_generation + 2;
+        let mut compaction_writer = get_write_handle(
+            &self.path,
+            compaction_target_generation,
+            LogFileType::Temporary,
+        )?;
+        let new_writer = get_write_handle(&self.path, new_writes_generation, LogFileType::Blessed)?;
+        // Note: Most of this Step 1 implementation is meant to be future-proof for multi-threading,
+        //       but this transition to a new write generation probably requires a critical section (i.e. Mutex)
+        self.writer = new_writer;
+        self.readers.insert(
+            compaction_target_generation,
+            get_read_handle(
+                &self.path,
+                compaction_target_generation,
+                LogFileType::Temporary,
+            )?,
+        );
+        self.readers.insert(
+            new_writes_generation,
+            get_read_handle(&self.path, new_writes_generation, LogFileType::Blessed)?,
+        );
+        self.current_generation = new_writes_generation;
+
+        // Step 2) Read previous log files, writing the latest values of any keys encountered
+        // to the new compaction target file.
+        let mut already_handled = HashSet::new();
+        for generation in gen_list.clone() {
+            let mut reader = get_read_handle(&self.path, generation, LogFileType::Blessed)?;
+            reader.seek(SeekFrom::Start(0))?;
+            while let Ok(cmd) = Command::from_reader(&mut reader) {
+                match cmd {
+                    Command::Set { key, value: _ } => {
+                        if already_handled.contains(&key) {
+                            // no work to be done, we already handled (wrote) latest value of key to compaction target
+                            continue;
+                        }
+                        // look up latest value for key and write to compaction target
+                        if let Some(value) = self.get(key.clone())? {
+                            let current_pos = compaction_writer.seek(SeekFrom::End(0))?;
+                            let estimated_bytes = key.len() + value.len();
+                            Command::Set {
+                                key: key.clone(),
+                                value,
+                            }
+                            .to_writer(&mut compaction_writer)?;
+                            self.writer.flush()?;
+                            // now must update in-memory map to allow future reads to get this value
+                            // (and not try to read from old files which we're about to delete in step 4)
+                            self.map.set(
+                                &key,
+                                compaction_target_generation,
+                                current_pos,
+                                estimated_bytes,
+                            )?;
+                        }
+                        already_handled.insert(key);
+                    }
+                    Command::Remove { key } => {
+                        already_handled.insert(key);
+                    }
+                }
+            }
+        }
+
+        // Step 3) now all previous logs are compacted into compaction_target_generation, so bless that file by renaming it.
+        // NOTE: multi-threading will require a critical section here too
+        drop(compaction_writer);
+        fs::rename(
+            log_path(
+                &self.path,
+                compaction_target_generation,
+                LogFileType::Temporary,
+            ),
+            log_path(
+                &self.path,
+                compaction_target_generation,
+                LogFileType::Blessed,
+            ),
+        )?;
+        self.readers.insert(
+            compaction_target_generation,
+            get_read_handle(
+                &self.path,
+                compaction_target_generation,
+                LogFileType::Blessed,
+            )?,
+        );
+        self.wasted_bytes = 0;
+
+        // Step 4) Previous logs are now obsolete, so remove them.
+        for generation in gen_list {
+            fs::remove_file(log_path(&self.path, generation, LogFileType::Blessed))?;
+        }
+
         Ok(())
     }
 }
@@ -200,6 +314,12 @@ impl InternalMap {
     ) -> Result<usize> {
         let mut wasted_bytes = 0;
         if let Some(entry_that_will_be_overwritten) = self.map.get(key) {
+            if entry_that_will_be_overwritten.generation > generation {
+                // if incoming write is from a previous generation as the one it is replacing
+                // then exit early (i.e. block the update). This should only ever happen
+                // during compaction.
+                return Ok(0);
+            }
             wasted_bytes = entry_that_will_be_overwritten.estimated_bytes;
         }
         self.map.insert(
@@ -246,8 +366,13 @@ fn sorted_gen_list(path: &Path) -> Result<Vec<u64>> {
     Ok(gen_list)
 }
 
-fn get_write_handle(path: &Path, gen: u64) -> Result<BufWriter<fs::File>> {
-    let file_path = log_path(path, gen);
+enum LogFileType {
+    Temporary, // temporary log file, used during compaction, should not receive active reads or writes
+    Blessed,   // blessed log file, ready for active reads and write
+}
+
+fn get_write_handle(path: &Path, gen: u64, temporary: LogFileType) -> Result<BufWriter<fs::File>> {
+    let file_path = log_path(path, gen, temporary);
     let context = format!("Opening file {:?} for writing", file_path.to_str());
     let file = fs::OpenOptions::new()
         .create(true)
@@ -258,8 +383,12 @@ fn get_write_handle(path: &Path, gen: u64) -> Result<BufWriter<fs::File>> {
     Ok(BufWriter::new(file))
 }
 
-fn get_read_handle(path: &Path, gen: u64) -> Result<BufReader<fs::File>> {
-    let file_path = log_path(path, gen);
+fn get_read_handle(
+    path: &Path,
+    gen: u64,
+    log_file_type: LogFileType,
+) -> Result<BufReader<fs::File>> {
+    let file_path = log_path(path, gen, log_file_type);
     let context = format!("Opening file {:?} for reading", file_path.to_str());
     let file = fs::OpenOptions::new()
         .read(true)
@@ -268,6 +397,10 @@ fn get_read_handle(path: &Path, gen: u64) -> Result<BufReader<fs::File>> {
     Ok(BufReader::new(file))
 }
 
-fn log_path(dir: &Path, gen: u64) -> PathBuf {
-    dir.join(format!("{}.log", gen))
+fn log_path(dir: &Path, gen: u64, log_file_type: LogFileType) -> PathBuf {
+    let file_extension = match log_file_type {
+        LogFileType::Temporary => "tmp",
+        LogFileType::Blessed => "log",
+    };
+    dir.join(format!("{}.{}", gen, file_extension))
 }
