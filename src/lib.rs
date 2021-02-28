@@ -6,7 +6,7 @@
 mod command;
 
 pub use anyhow::Result;
-use anyhow::{bail, Context};
+use anyhow::{anyhow, bail, Context};
 use command::Command;
 use std::collections::HashMap;
 use std::ffi::OsStr;
@@ -98,10 +98,10 @@ impl KvStore {
         while let Ok(cmd) = Command::from_reader(&mut reader) {
             match cmd {
                 Command::Set { key, value: _ } => {
-                    self.map.set(key, current_pos)?;
+                    self.map.set(&key, current_pos)?;
                 }
                 Command::Remove { key } => {
-                    self.map.remove(key)?;
+                    self.map.remove(&key)?;
                 }
             }
             current_pos = reader.seek(SeekFrom::Current(0))?;
@@ -114,8 +114,7 @@ impl KvStore {
     pub fn set(&mut self, key: String, value: String) -> Result<()> {
         // Store current end position to map
         let current_pos = self.writer.seek(SeekFrom::End(0))?;
-        // TODO: remove these clones. actually should probably just make the input a &str
-        self.map.set(key.clone(), current_pos)?;
+        self.map.set(&key, current_pos)?;
 
         // Actually write to file
         let cmd = Command::Set { key, value };
@@ -127,28 +126,26 @@ impl KvStore {
 
     /// Get Some(value) from the KvStore, searching by `key`. If the `key` is not present, None will be returned.
     pub fn get(&mut self, key: String) -> Result<Option<String>> {
-        let value = self.map.get(key)?.and_then(|file_pos| {
-            // TODO: don't assume all values are in current gen
-            // TODO: don't unwrap here
-            let mut reader = self.readers.get_mut(&self.current_generation).unwrap();
-            // TODO: ignoring this Result is bad. How do we propagate Result out?
-            reader.seek(SeekFrom::Start(file_pos)).ok()?;
-            if let Ok(cmd) = Command::from_reader(&mut reader) {
-                match cmd {
-                    Command::Set { key: _, value } => Some(value),
-                    Command::Remove { key: _ } => None,
-                }
-            } else {
-                None
-            }
-        });
-        Ok(value)
+        let maybe_file_pos = self.map.get(&key)?;
+        if maybe_file_pos.is_none() {
+            return Ok(None);
+        }
+        let file_pos = maybe_file_pos.unwrap();
+        // TODO: don't assume all values are in current gen
+        let mut reader = self
+            .readers
+            .get_mut(&self.current_generation)
+            .ok_or(anyhow!("Unable to open reader for current generation"))?;
+        reader.seek(SeekFrom::Start(file_pos))?;
+        Command::from_reader(&mut reader).map(|cmd| match cmd {
+            Command::Set { key: _, value } => Some(value),
+            Command::Remove { key: _ } => None,
+        })
     }
 
     /// Removes `key` from the KvStore. This will succeed whether the `key` is present or not.
     pub fn remove(&mut self, key: String) -> Result<()> {
-        // TODO: remove these clones. actually should probably just make the input a &str
-        self.map.remove(key.clone())?;
+        self.map.remove(&key)?;
 
         let cmd = Command::Remove { key };
         cmd.to_writer(&mut self.writer)?;
@@ -169,15 +166,15 @@ impl InternalMap {
             map: HashMap::new(),
         }
     }
-    fn set(&mut self, key: String, file_pos: u64) -> Result<()> {
-        self.map.insert(key, file_pos);
+    fn set(&mut self, key: &str, file_pos: u64) -> Result<()> {
+        self.map.insert(key.to_owned(), file_pos);
         Ok(())
     }
-    fn get(&self, key: String) -> Result<Option<u64>> {
-        Ok(self.map.get(&key).cloned())
+    fn get(&self, key: &str) -> Result<Option<u64>> {
+        Ok(self.map.get(key).cloned())
     }
-    fn remove(&mut self, key: String) -> Result<()> {
-        if self.map.remove(&key).is_none() {
+    fn remove(&mut self, key: &str) -> Result<()> {
+        if self.map.remove(key).is_none() {
             bail!("Key not found");
         }
         Ok(())
