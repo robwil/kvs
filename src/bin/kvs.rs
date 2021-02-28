@@ -76,13 +76,13 @@ fn handle_args(matches: &clap::ArgMatches) -> Result<()> {
         handle_rm(&mut kv_store, key)?;
     }
 
-    if let Some(_) = matches.subcommand_matches("interactive") {
+    if matches.subcommand_matches("interactive").is_some() {
         println!("Welcome to interactive mode. Type \"exit\" to end.");
         loop {
             let stdin = io::stdin(); // We get `Stdin` here.
             let mut buffer = String::new();
             stdin.read_line(&mut buffer)?;
-            let split: Vec<_> = buffer.split(" ")
+            let split: Vec<_> = buffer.split(' ')
                 .map(|str| str.trim())
                 .collect();
             match split.get(0).cloned() {

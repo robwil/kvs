@@ -1,4 +1,5 @@
 #![deny(missing_docs)]
+#![warn(rust_2018_idioms)]
 
 //! The kvs crate library implements a KvStore type, which is a basic key-value store.
 //! Currently, it stores values in memory, but future work will store to disk.
@@ -147,7 +148,7 @@ impl KvStore {
                 file_pos,
                 estimated_bytes: _,
             }) => {
-                let mut reader = self.readers.get_mut(&generation).ok_or(anyhow!(
+                let mut reader = self.readers.get_mut(&generation).ok_or_else(|| anyhow!(
                     "Unable to open reader for generation {} during get",
                     generation
                 ))?;
